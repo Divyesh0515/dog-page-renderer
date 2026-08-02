@@ -1,39 +1,30 @@
 const express = require("express");
 const Jimp = require("jimp");
 const axios = require("axios");
+const crypto = require("crypto");
+const FormData = require("form-data");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
-// Cloudinary config from env
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
 app.get("/", (req, res) => {
-  res.json({
-    status: "Paws & Heroes Renderer Running!",
-    endpoint: "POST /render",
-    version: "2.0.0",
-  });
+  res.json({ status: "Paws & Heroes Renderer v3.0 Running!", version: "3.0.0" });
 });
 
 app.get("/health", (req, res) => {
   res.json({ status: "OK", timestamp: new Date().toISOString() });
 });
 
-// Upload to Cloudinary using signed upload
 async function uploadToCloudinary(imageBuffer) {
-  const crypto = require("crypto");
   const timestamp = Math.round(new Date().getTime() / 1000);
-  
-  // Create signature
   const signatureString = `timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
   const signature = crypto.createHash("sha1").update(signatureString).digest("hex");
 
-  const FormData = require("form-data");
   const form = new FormData();
   form.append("file", imageBuffer, { filename: "rendered.jpg", contentType: "image/jpeg" });
   form.append("api_key", CLOUDINARY_API_KEY);
@@ -45,126 +36,197 @@ async function uploadToCloudinary(imageBuffer) {
     form,
     { headers: form.getHeaders() }
   );
-
   return response.data.secure_url;
+}
+
+// Draw solid color rectangle
+function drawRect(image, x, y, w, h, r, g, b, a) {
+  for (let py = y; py < y + h; py++) {
+    for (let px = x; px < x + w; px++) {
+      if (px >= 0 && px < image.getWidth() && py >= 0 && py < image.getHeight()) {
+        const existing = Jimp.intToRGBA(image.getPixelColor(px, py));
+        const blendR = Math.floor(existing.r * (1 - a / 255) + r * (a / 255));
+        const blendG = Math.floor(existing.g * (1 - a / 255) + g * (a / 255));
+        const blendB = Math.floor(existing.b * (1 - a / 255) + b * (a / 255));
+        image.setPixelColor(Jimp.rgbaToInt(blendR, blendG, blendB, 255), px, py);
+      }
+    }
+  }
 }
 
 app.post("/render", async (req, res) => {
   try {
-    const { image_url, headline, page_name = "Paws & Heroes" } = req.body;
+    const { image_url, headline, page_name = "Paws & Heroes", style } = req.body;
 
     if (!image_url || !headline) {
-      return res.status(400).json({
-        error: "image_url and headline are required",
-      });
+      return res.status(400).json({ error: "image_url and headline are required" });
     }
 
-    console.log("Processing:", { image_url, headline, page_name });
+    // Auto rotate style 1,2,3
+    const styleNum = style || (Math.floor(Date.now() / 1000) % 3) + 1;
+    console.log(`Processing style ${styleNum}:`, headline);
 
-    // STEP 1: Download image
-    const imageResponse = await axios.get(image_url, {
-      responseType: "arraybuffer",
-    });
-    const imageBuffer = Buffer.from(imageResponse.data);
+    // Download image
+    const imageResponse = await axios.get(image_url, { responseType: "arraybuffer" });
+    const image = await Jimp.read(Buffer.from(imageResponse.data));
 
-    // STEP 2: Load with Jimp
-    const image = await Jimp.read(imageBuffer);
-    const imgWidth = image.getWidth();
-    const imgHeight = image.getHeight();
+    const W = image.getWidth();
+    const H = image.getHeight();
 
-    // STEP 3: Dark gradient overlay bottom
-    const gradientHeight = Math.floor(imgHeight * 0.45);
-    const gradientStart = imgHeight - gradientHeight;
+    // BLACK SOLID BAR — bottom 35%
+    const barH = Math.floor(H * 0.35);
+    const barY = H - barH;
+    drawRect(image, 0, barY, W, barH, 0, 0, 0, 255);
 
-    for (let y = gradientStart; y < imgHeight; y++) {
-      const progress = (y - gradientStart) / gradientHeight;
-      for (let x = 0; x < imgWidth; x++) {
-        const pixel = image.getPixelColor(x, y);
-        const rgba = Jimp.intToRGBA(pixel);
-        const newR = Math.floor(rgba.r * (1 - progress * 0.75));
-        const newG = Math.floor(rgba.g * (1 - progress * 0.75));
-        const newB = Math.floor(rgba.b * (1 - progress * 0.75));
-        image.setPixelColor(Jimp.rgbaToInt(newR, newG, newB, rgba.a), x, y);
+    // Load fonts
+    const bigFont = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
+    const medFont = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
+    const smallFont = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
+
+    // Split headline into words
+    const words = headline.toUpperCase().split(" ");
+    const maxW = W - 40;
+
+    // Build lines
+    let lines = [];
+    let currentLine = "";
+    for (const word of words) {
+      const test = currentLine ? `${currentLine} ${word}` : word;
+      const tw = Jimp.measureText(bigFont, test);
+      if (tw <= maxW) {
+        currentLine = test;
+      } else {
+        if (currentLine) lines.push(currentLine);
+        currentLine = word;
       }
     }
+    if (currentLine) lines.push(currentLine);
 
-    // STEP 4: Load fonts
-    const headlineFont = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
-    const watermarkFont = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
+    // Limit to 3 lines
+    lines = lines.slice(0, 3);
 
-    // STEP 5: Headline text
-    const headlineUpper = headline.toUpperCase();
-    const words = headlineUpper.split(" ");
-    const maxWidth = imgWidth - 60;
+    const lineH = 72;
+    const pageNameH = 35;
+    const bottomPad = 15;
+    const totalTextH = lines.length * lineH + pageNameH + bottomPad;
+    let startY = H - totalTextH - 10;
 
-    let line1 = "";
-    let line2 = "";
-    let currentLine = "";
+    // =============================================
+    // STYLE 1 — White + Orange highlight
+    // Key words (first 2) in orange, rest white
+    // =============================================
+    if (styleNum === 1) {
+      // Orange accent words (first 2 words of headline)
+      const accentWords = words.slice(0, 2);
 
-    for (const word of words) {
-      const testLine = currentLine ? `${currentLine} ${word}` : word;
-      const textWidth = Jimp.measureText(headlineFont, testLine);
-      if (textWidth <= maxWidth) {
-        currentLine = testLine;
-      } else {
-        if (!line1) {
-          line1 = currentLine;
-          currentLine = word;
-        } else {
-          line2 = line2 ? line2 + " " + word : currentLine + " " + word;
-          currentLine = "";
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const lineWords = line.split(" ");
+        const lineW = Jimp.measureText(bigFont, line);
+        let curX = Math.floor((W - lineW) / 2);
+        const curY = startY + i * lineH;
+
+        for (const w of lineWords) {
+          const isAccent = accentWords.includes(w);
+          const wW = Jimp.measureText(bigFont, w + " ");
+
+          if (isAccent) {
+            // Draw orange color overlay for accent word
+            // Since Jimp only has white/black fonts, we draw orange rect then white text
+            // We'll use a trick: draw the word position with orange background
+            drawRect(image, curX - 2, curY, wW, lineH - 5, 255, 140, 0, 255);
+          }
+          image.print(bigFont, curX, curY, w);
+          curX += wW;
+          if (curX < W - 20) {
+            image.print(bigFont, curX, curY, " ");
+            curX += Jimp.measureText(bigFont, " ");
+          }
         }
       }
     }
-    if (currentLine) {
-      if (!line1) line1 = currentLine;
-      else line2 = line2 ? line2 + " " + currentLine : currentLine;
+
+    // =============================================
+    // STYLE 2 — News Style: "NEWS" tag + orange left border
+    // =============================================
+    else if (styleNum === 2) {
+      // NEWS tag
+      const newsTagW = 90;
+      const newsTagH = 32;
+      const newsTagX = 20;
+      const newsTagY = barY + 10;
+      drawRect(image, newsTagX, newsTagY, newsTagW, newsTagH, 255, 140, 0, 255);
+      image.print(smallFont, newsTagX + 8, newsTagY + 8, "NEWS");
+
+      // Orange left border line
+      drawRect(image, 20, newsTagY + newsTagH + 8, 5, lines.length * lineH + 10, 255, 140, 0, 255);
+
+      // White text with left border offset
+      for (let i = 0; i < lines.length; i++) {
+        const curY = newsTagY + newsTagH + 10 + i * lineH;
+        image.print(bigFont, 35, curY, lines[i]);
+      }
+
+      startY = newsTagY + newsTagH + 10 + lines.length * lineH;
     }
 
-    const lineHeight = 72;
-    const bottomPadding = 25;
-    const watermarkH = 25;
-    const watermarkY = imgHeight - watermarkH - bottomPadding;
-    const line2Y = watermarkY - lineHeight - 10;
-    const line1Y = line2 ? line2Y - lineHeight - 5 : line2Y;
+    // =============================================
+    // STYLE 3 — White + Cyan highlight
+    // Key emotional words in cyan
+    // =============================================
+    else if (styleNum === 3) {
+      const accentWords = words.slice(1, 3); // middle words get cyan
 
-    // Draw lines centered
-    const l1W = Jimp.measureText(headlineFont, line1);
-    image.print(headlineFont, Math.floor((imgWidth - l1W) / 2), line1Y, line1);
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const lineWords = line.split(" ");
+        const lineW = Jimp.measureText(bigFont, line);
+        let curX = Math.floor((W - lineW) / 2);
+        const curY = startY + i * lineH;
 
-    if (line2) {
-      const l2W = Jimp.measureText(headlineFont, line2);
-      image.print(headlineFont, Math.floor((imgWidth - l2W) / 2), line2Y, line2);
+        for (const w of lineWords) {
+          const isAccent = accentWords.includes(w);
+          const wW = Jimp.measureText(bigFont, w);
+
+          if (isAccent) {
+            // Cyan background for accent
+            drawRect(image, curX - 2, curY, wW + 4, lineH - 5, 0, 200, 200, 255);
+          }
+          image.print(bigFont, curX, curY, w);
+          curX += wW + Jimp.measureText(bigFont, " ");
+        }
+      }
     }
 
-    // STEP 6: Watermark
-    const watermarkText = `PAWS & HEROES`;
-    const wW = Jimp.measureText(watermarkFont, watermarkText);
-    image.print(watermarkFont, imgWidth - wW - 15, watermarkY, watermarkText);
+    // For style 1 & 3 — print lines normally (already done above with color)
+    if (styleNum === 1 || styleNum === 3) {
+      // Already printed above with accent colors
+    } else if (styleNum === 2) {
+      // Already printed above
+    }
 
-    // STEP 7: Get buffer
+    // =============================================
+    // PAGE NAME — Center Bottom (All styles)
+    // =============================================
+    const pageNameY = H - pageNameH - bottomPad;
+    const pageText = page_name.toUpperCase();
+    const pageW = Jimp.measureText(medFont, pageText);
+    image.print(medFont, Math.floor((W - pageW) / 2), pageNameY, pageText);
+
+    // Upload to Cloudinary
     const outputBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
-
-    // STEP 8: Upload to Cloudinary
     console.log("Uploading to Cloudinary...");
     const cloudinaryUrl = await uploadToCloudinary(outputBuffer);
-    console.log("✅ Cloudinary URL:", cloudinaryUrl);
+    console.log("✅ Done:", cloudinaryUrl);
 
-    // STEP 9: Return URL
-    res.json({
-      success: true,
-      image_url: cloudinaryUrl,
-    });
+    res.json({ success: true, image_url: cloudinaryUrl, style: styleNum });
 
   } catch (error) {
-    console.error("❌ Render error:", error.message);
-    res.status(500).json({
-      error: "Render failed",
-      message: error.message,
-    });
+    console.error("❌ Error:", error.message);
+    res.status(500).json({ error: "Render failed", message: error.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`🐾 Paws & Heroes Renderer v2.0 running on port ${PORT}`);
+  console.log(`🐾 Paws & Heroes Renderer v3.0 on port ${PORT}`);
 });
