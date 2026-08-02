@@ -121,10 +121,25 @@ app.post("/render", async (req, res) => {
     const W = image.getWidth();
     const H = image.getHeight();
 
-    // BLACK SOLID BAR — bottom 38%
-    const barH = Math.floor(H * 0.38);
-    const barY = H - barH;
-    drawRect(image, 0, barY, W, barH, 0, 0, 0, 255);
+    // GRADIENT OVERLAY — bottom 45% with 40% opacity
+const gradH = Math.floor(H * 0.45);
+const gradStart = H - gradH;
+for (let y = gradStart; y < H; y++) {
+  const progress = (y - gradStart) / gradH;
+  const alpha = Math.floor(progress * 102); // 40% opacity max = 102/255
+  for (let x = 0; x < W; x++) {
+    const pixel = image.getPixelColor(x, y);
+    const rgba = Jimp.intToRGBA(pixel);
+    const newR = Math.floor(rgba.r * (1 - progress * 0.85));
+    const newG = Math.floor(rgba.g * (1 - progress * 0.85));
+    const newB = Math.floor(rgba.b * (1 - progress * 0.85));
+    image.setPixelColor(
+      Jimp.rgbaToInt(newR, newG, newB, rgba.a), x, y
+    );
+  }
+}
+const barY = gradStart;
+const barH = gradH;
 
     // SMART FONT — auto size to fit
     const maxTextW = W - 30;
