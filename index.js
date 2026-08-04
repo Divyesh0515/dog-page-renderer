@@ -1,30 +1,19 @@
 const express = require("express");
-const { createCanvas, registerFont, loadImage } = require("@napi-rs/canvas");
+const Jimp = require("jimp");
 const axios = require("axios");
 const crypto = require("crypto");
 const FormData = require("form-data");
-const path = require("path");
 
 const app = express();
 app.use(express.json());
-const PORT = process.env.PORT || 3000;
 
+const PORT = process.env.PORT || 3000;
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
-// Register fonts from fonts/ folder
-try {
-  registerFont(path.join(__dirname, "fonts", "impact.ttf"), { family: "Impact" });
-  registerFont(path.join(__dirname, "fonts", "BebasNeue-Regular.ttf"), { family: "BebasNeue" });
-  registerFont(path.join(__dirname, "fonts", "Poppins-ExtraBold.ttf"), { family: "Poppins" });
-  console.log("✅ Fonts loaded!");
-} catch (e) {
-  console.log("⚠️ Font error:", e.message);
-}
-
-app.get("/", (req, res) => res.json({ status: "Renderer v7.0 Running!" }));
-app.get("/health", (req, res) => res.json({ status: "OK" }));
+app.get("/", (req, res) => res.json({ status: "Renderer v8.0 Running!" }));
+app.get("/health", (req, res) => res.json({ status: "OK", timestamp: new Date().toISOString() }));
 
 async function uploadToCloudinary(buffer) {
   const timestamp = Math.round(Date.now() / 1000);
@@ -38,227 +27,206 @@ async function uploadToCloudinary(buffer) {
   form.append("signature", sig);
   const res = await axios.post(
     `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`,
-    form, { headers: form.getHeaders() }
+    form,
+    { headers: form.getHeaders(), timeout: 30000 }
   );
   return res.data.secure_url;
 }
 
-// Wrap text into lines
-function wrapText(ctx, text, maxWidth) {
-  const words = text.split(" ");
-  const lines = [];
-  let cur = "";
-  for (const w of words) {
-    const test = cur ? `${cur} ${w}` : w;
-    if (ctx.measureText(test).width <= maxWidth) {
-      cur = test;
-    } else {
-      if (cur) lines.push(cur);
-      cur = w;
+function drawGradient(image) {
+  const W = image.getWidth();
+  const H = image.getHeight();
+  const gradH = Math.floor(H * 0.50);
+  const gradStart = H - gradH;
+  for (let y = gradStart; y < H; y++) {
+    const progress = (y - gradStart) / gradH;
+    const opacity = progress * 0.60;
+    for (let x = 0; x < W; x++) {
+      const px = Jimp.intToRGBA(image.getPixelColor(x, y));
+      const blend = (c) => Math.max(0, Math.min(255, Math.floor(c * (1 - opacity))));
+      image.setPixelColor(
+        Jimp.rgbaToInt(blend(px.r), blend(px.g), blend(px.b), 255),
+        x, y
+      );
     }
   }
-  if (cur) lines.push(cur);
-  return lines.slice(0, 4);
 }
 
-// Auto font size
-function getAutoFontSize(ctx, text, maxWidth, maxSize, minSize, fontFamily) {
-  for (let size = maxSize; size >= minSize; size -= 4) {
-    ctx.font = `${size}px ${fontFamily}`;
+function drawRect(image, x, y, w, h, r, g, b, opacity) {
+  const imgW = image.getWidth();
+  const imgH = image.getHeight();
+  for (let py = Math.max(0, y); py < Math.min(y + h, imgH); py++) {
+    for (let px2 = Math.max(0, x); px2 < Math.min(x + w, imgW); px2++) {
+      const existing = Jimp.intToRGBA(image.getPixelColor(px2, py));
+      const blend = (a, b2) => Math.max(0, Math.min(255, Math.floor(a * (1 - opacity) + b2 * opacity)));
+      image.setPixelColor(
+        Jimp.rgbaToInt(blend(existing.r, r), blend(existing.g, g), blend(existing.b, b), 255),
+        px2, py
+      );
+    }
+  }
+}
+
+async function getSmartFont(text, maxWidth) {
+  const sizes = [
+    { font: await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE), lineH: 75 },
+    { font: await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE), lineH: 40 },
+    { font: await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE), lineH: 24 },
+  ];
+
+  for (const f of sizes) {
     const words = text.split(" ");
-    let fits = true;
+    let lines = [];
     let cur = "";
-    let lineCount = 0;
     for (const w of words) {
       const test = cur ? `${cur} ${w}` : w;
-      if (ctx.measureText(test).width <= maxWidth) {
+      if (Jimp.measureText(f.font, test) <= maxWidth) {
         cur = test;
       } else {
-        lineCount++;
+        if (cur) lines.push(cur);
         cur = w;
-        if (lineCount > 3) { fits = false; break; }
       }
     }
-    if (fits) return size;
+    if (cur) lines.push(cur);
+    const allFit = lines.every(l => Jimp.measureText(f.font, l) <= maxWidth);
+    if (allFit && lines.length <= 4) return { ...f, lines };
   }
-  return minSize;
+  const fallback = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
+  return { font: fallback, lineH: 24, lines: [text.substring(0, 35)] };
 }
 
 app.post("/render", async (req, res) => {
   try {
     const { image_url, headline, page_name = "Paws & Heroes", style } = req.body;
-    if (!image_url || !headline) return res.status(400).json({ error: "Missing fields" });
+
+    if (!image_url || !headline) {
+      return res.status(400).json({ error: "Missing image_url or headline" });
+    }
+
+    console.log(`Processing style ${style || "auto"}:`, headline);
+    console.log("Image URL:", image_url);
 
     const styleNum = style || (Math.floor(Date.now() / 1000) % 3) + 1;
-    console.log(`Style ${styleNum}:`, headline);
+
+    // Download image with timeout
+    let imgBuffer;
+    try {
+      const imgRes = await axios.get(image_url, {
+        responseType: "arraybuffer",
+        timeout: 15000,
+        headers: { "User-Agent": "Mozilla/5.0" }
+      });
+      imgBuffer = Buffer.from(imgRes.data);
+    } catch (e) {
+      console.error("Image download failed:", e.message);
+      return res.status(400).json({ error: "Image download failed", message: e.message });
+    }
 
     // Load image
-    const imgRes = await axios.get(image_url, { responseType: "arraybuffer" });
-    const srcImg = await loadImage(Buffer.from(imgRes.data));
+    let image;
+    try {
+      image = await Jimp.read(imgBuffer);
+    } catch (e) {
+      console.error("Image read failed:", e.message);
+      return res.status(400).json({ error: "Image read failed", message: e.message });
+    }
 
-    const W = srcImg.width;
-    const H = srcImg.height;
+    const W = image.getWidth();
+    const H = image.getHeight();
+    console.log(`Image size: ${W}x${H}`);
 
-    const canvas = createCanvas(W, H);
-    const ctx = canvas.getContext("2d");
+    // Resize if too large
+    if (W > 1200) {
+      image.resize(1080, Jimp.AUTO);
+    }
 
-    // Draw image
-    ctx.drawImage(srcImg, 0, 0, W, H);
+    const newW = image.getWidth();
+    const newH = image.getHeight();
 
-    // =============================================
-    // GRADIENT OVERLAY — 0% to 60% opacity
-    // =============================================
-    const gradH = Math.floor(H * 0.50);
-    const gradY = H - gradH;
-    const grad = ctx.createLinearGradient(0, gradY, 0, H);
-    grad.addColorStop(0, "rgba(0,0,0,0)");
-    grad.addColorStop(0.45, "rgba(0,0,0,0.40)");
-    grad.addColorStop(1, "rgba(0,0,0,0.60)");
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, gradY, W, gradH);
+    // Gradient
+    drawGradient(image);
 
-    // =============================================
-    // AUTO FONT SIZE
-    // =============================================
-    const textMaxW = W - 50;
-    const fontSize = getAutoFontSize(ctx, headline.toUpperCase(), textMaxW, Math.floor(W * 0.12), Math.floor(W * 0.05), "Impact");
-    const lineH = Math.floor(fontSize * 1.12);
+    // Fonts
+    const maxTextW = newW - 40;
+    const { font, lineH, lines } = await getSmartFont(headline.toUpperCase(), maxTextW);
+    const smallFont = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
+    const medFont = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
 
-    ctx.font = `${fontSize}px Impact`;
-    const lines = wrapText(ctx, headline.toUpperCase(), textMaxW);
-
-    const pageNameSize = Math.floor(W * 0.038);
-    const bottomPad = Math.floor(H * 0.035);
-    const totalTextH = lines.length * lineH + pageNameSize + bottomPad + 10;
-    const textStartY = H - totalTextH - Math.floor(H * 0.02);
-
+    const pageNameH = 38;
+    const bottomPad = 20;
+    const totalH = lines.length * lineH + pageNameH + bottomPad;
+    const textStartY = newH - totalH - 15;
     const words = headline.toUpperCase().split(" ");
 
-    // =============================================
-    // STYLE 1 — White + Orange (Canine Journal style)
-    // =============================================
+    // Style 1 — Orange highlight
     if (styleNum === 1) {
-      const accentWords = words.slice(0, 3);
-
+      const accentWords = words.slice(0, 2);
       for (let i = 0; i < lines.length; i++) {
         const lineWords = lines[i].split(" ");
-        ctx.font = `${fontSize}px Impact`;
-        const lineW = ctx.measureText(lines[i]).width;
-        let curX = Math.floor((W - lineW) / 2);
-        const curY = textStartY + i * lineH + fontSize;
-
+        const lineW = Jimp.measureText(font, lines[i]);
+        let curX = Math.floor((newW - lineW) / 2);
+        const curY = textStartY + i * lineH;
         for (const w of lineWords) {
-          const wW = ctx.measureText(w).width;
-          const spW = ctx.measureText(" ").width;
-
+          const wW = Jimp.measureText(font, w);
+          const spW = Jimp.measureText(font, " ");
           if (accentWords.includes(w)) {
-            ctx.fillStyle = "#FF8C00";
-          } else {
-            ctx.fillStyle = "#FFFFFF";
+            drawRect(image, curX - 3, curY + 4, wW + 6, lineH - 8, 255, 130, 0, 0.95);
           }
-
-          // Text shadow
-          ctx.shadowColor = "rgba(0,0,0,0.9)";
-          ctx.shadowBlur = 10;
-          ctx.shadowOffsetX = 3;
-          ctx.shadowOffsetY = 3;
-          ctx.fillText(w, curX, curY);
-          ctx.shadowBlur = 0;
-          ctx.shadowOffsetX = 0;
-          ctx.shadowOffsetY = 0;
+          image.print(font, curX, curY, w);
           curX += wW + spW;
         }
       }
     }
 
-    // =============================================
-    // STYLE 2 — NEWS tag + Orange border
-    // =============================================
+    // Style 2 — NEWS tag
     else if (styleNum === 2) {
-      const leftPad = Math.floor(W * 0.05);
-      const newsSize = Math.floor(W * 0.032);
-      const newsTagH = Math.floor(newsSize * 1.6);
-      const newsTagW = Math.floor(newsSize * 3.2);
-      const newsTagY = textStartY - newsTagH - 10;
-
-      // Orange NEWS tag
-      ctx.fillStyle = "#FF8C00";
-      ctx.fillRect(leftPad, newsTagY, newsTagW, newsTagH);
-      ctx.fillStyle = "#FFFFFF";
-      ctx.font = `bold ${newsSize}px Poppins, Arial`;
-      ctx.fillText("NEWS", leftPad + 6, newsTagY + newsTagH - 6);
-
-      // Orange left border
-      ctx.fillStyle = "#FF8C00";
-      ctx.fillRect(leftPad, textStartY, 5, lines.length * lineH + 5);
-
-      // White text
-      ctx.fillStyle = "#FFFFFF";
-      ctx.font = `${fontSize}px Impact`;
-      ctx.shadowColor = "rgba(0,0,0,0.9)";
-      ctx.shadowBlur = 10;
-      ctx.shadowOffsetX = 3;
-      ctx.shadowOffsetY = 3;
+      const leftPad = 20;
+      const newsTagH = 28;
+      const newsTagW = 85;
+      const newsTagY = textStartY - newsTagH - 8;
+      drawRect(image, leftPad, newsTagY, newsTagW, newsTagH, 255, 130, 0, 0.95);
+      image.print(smallFont, leftPad + 8, newsTagY + 6, "NEWS");
+      drawRect(image, leftPad, textStartY, 5, lines.length * lineH + 8, 255, 130, 0, 0.95);
       for (let i = 0; i < lines.length; i++) {
-        ctx.fillText(lines[i], leftPad + 15, textStartY + i * lineH + fontSize);
+        image.print(font, leftPad + 15, textStartY + i * lineH, lines[i]);
       }
-      ctx.shadowBlur = 0;
-      ctx.shadowOffsetX = 0;
-      ctx.shadowOffsetY = 0;
     }
 
-    // =============================================
-    // STYLE 3 — White + Cyan
-    // =============================================
+    // Style 3 — Cyan highlight
     else if (styleNum === 3) {
-      const accentWords = words.slice(1, 4);
-
+      const accentWords = words.slice(1, 3);
       for (let i = 0; i < lines.length; i++) {
         const lineWords = lines[i].split(" ");
-        ctx.font = `${fontSize}px Impact`;
-        const lineW = ctx.measureText(lines[i]).width;
-        let curX = Math.floor((W - lineW) / 2);
-        const curY = textStartY + i * lineH + fontSize;
-
+        const lineW = Jimp.measureText(font, lines[i]);
+        let curX = Math.floor((newW - lineW) / 2);
+        const curY = textStartY + i * lineH;
         for (const w of lineWords) {
-          const wW = ctx.measureText(w).width;
-          const spW = ctx.measureText(" ").width;
-
-          ctx.fillStyle = accentWords.includes(w) ? "#00D2D2" : "#FFFFFF";
-          ctx.shadowColor = "rgba(0,0,0,0.9)";
-          ctx.shadowBlur = 10;
-          ctx.shadowOffsetX = 3;
-          ctx.shadowOffsetY = 3;
-          ctx.fillText(w, curX, curY);
-          ctx.shadowBlur = 0;
-          ctx.shadowOffsetX = 0;
-          ctx.shadowOffsetY = 0;
+          const wW = Jimp.measureText(font, w);
+          const spW = Jimp.measureText(font, " ");
+          if (accentWords.includes(w)) {
+            drawRect(image, curX - 3, curY + 4, wW + 6, lineH - 8, 0, 210, 210, 0.95);
+          }
+          image.print(font, curX, curY, w);
           curX += wW + spW;
         }
       }
     }
 
-    // =============================================
-    // PAGE NAME — Poppins, Center Bottom
-    // =============================================
-    ctx.font = `${pageNameSize}px Poppins, Arial`;
-    ctx.fillStyle = "rgba(255,255,255,0.92)";
-    ctx.shadowColor = "rgba(0,0,0,0.8)";
-    ctx.shadowBlur = 6;
-    const pageW = ctx.measureText(page_name).width;
-    ctx.fillText(page_name, Math.floor((W - pageW) / 2), H - bottomPad);
-    ctx.shadowBlur = 0;
+    // Page name
+    const pageW = Jimp.measureText(medFont, page_name);
+    image.print(medFont, Math.floor((newW - pageW) / 2), newH - pageNameH - bottomPad + 10, page_name);
 
-    // Export & Upload
-    const buffer = canvas.toBuffer("image/jpeg");
+    // Upload
+    const buffer = await image.getBufferAsync(Jimp.MIME_JPEG);
     const url = await uploadToCloudinary(buffer);
     console.log("✅ Done:", url);
     res.json({ success: true, image_url: url, style: styleNum });
 
   } catch (err) {
-    console.error("❌ Error:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Render error:", err.message);
+    console.error(err.stack);
+    res.status(500).json({ error: "Render failed", message: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`🐾 Renderer v7.0 on port ${PORT}`));
+app.listen(PORT, () => console.log(`🐾 Renderer v8.0 on port ${PORT}`));
